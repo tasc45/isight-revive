@@ -24,6 +24,10 @@ macOS Sonoma broke two things in Apple's FireWire iSight pipeline:
 
 Everything else is Apple's original code — untouched. The installer copies Apple's `IIDCVideoAssistant` from your system, applies the two patches, and sets up LaunchDaemons so it starts automatically on every boot.
 
+### Crash Protection
+
+If `IIDCVideoAssistant` crashes, FireWire isochronous bandwidth leaks on the bus. If it crash-loops (launchd restarts it repeatedly), the leaked resources accumulate and can cause a **kernel panic** in `AppleFWOHCI_ReceiveDCL::link()`. The guard fix shim includes a crash handler that catches fatal signals (SIGSEGV, SIGABRT, SIGBUS) and fires a FireWire bus reset to reclaim leaked IRM bandwidth before the process exits. This prevents leaked resources from stacking up across restarts.
+
 ### Audio
 
 The iSight's built-in microphone also works. Apple's original `iSightAudio.driver` uses an old CoreAudio API that modern macOS won't load. The installer wraps it with a thin translation layer that bridges the old flat-export API to the modern factory pattern. Your iSight shows up as both a camera AND a microphone in FaceTime, Zoom, and every other app.
@@ -178,7 +182,7 @@ sudo launchctl kickstart system/com.apple.cmio.IIDCVideoAssistant
 |------|---------|
 | `install.sh` | One-command installer |
 | `uninstall.sh` | Clean removal |
-| `fwafix_minimal.c` | Guard fix shim (40 lines) |
+| `fwafix_minimal.c` | Guard fix + crash cleanup (bus reset on crash) |
 | `isight_audio_wrapper.c` | Audio API bridge |
 | `safe_call.cpp` | C++ exception-safe wrappers for audio |
 | `iidc_entitlements.plist` | DYLD injection entitlements |

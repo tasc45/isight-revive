@@ -52,6 +52,7 @@ if [ "$HAS_CLANG" -eq 1 ]; then
     clang -arch x86_64 -shared \
         -o "$SCRIPT_DIR/fwafix_minimal.dylib" \
         "$SCRIPT_DIR/fwafix_minimal.c" \
+        -framework IOKit -framework CoreFoundation \
         -lSystem -Wno-deprecated-declarations 2>/dev/null
     codesign -s - "$SCRIPT_DIR/fwafix_minimal.dylib" 2>/dev/null
     echo "  Built from source."
