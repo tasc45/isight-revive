@@ -1,6 +1,39 @@
+# Build artifacts
 build/
 *.o
+*.dylib
 *.dSYM/
+!prebuilt/*.dylib
+
+# Compiled binaries
+iSightAudioWrapper
+bus_reset
+bus_reset2
+fix_bus
+fix_speed
+iidc_mode
+isight_capture
+kick_camera
+list_cameras
+read_iidc_regs
+reset_camera
+scan_channels
+set_iso_speed
+test_*
+!test_*.cpp
+
+# Apple binaries (cannot redistribute — installer copies from system)
+IIDCVideoAssistant.backup
+IIDCVideoAssistant.patched
+
+# Plugin/extension builds
+DALPlugin/iSightDAL.plugin/
+CameraExtension/iSightCamera.systemextension/
+CameraExtension/iSightHost.app/
+CameraExtension/test_extension
+CameraExtension/test_extension2
+
+# macOS metadata
 .DS_Store
 xcuserdata/
 DerivedData/

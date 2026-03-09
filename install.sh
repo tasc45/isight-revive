@@ -1,15 +1,24 @@
 #!/bin/bash
-# iSightRevive — Install Script
+# iSight Revive — One-Command Installer
+# Gets your FireWire iSight working on macOS Sonoma via OCLP
+#
+# Usage: sudo ./install.sh
 set -e
 
-PLUGIN_NAME="iSightRevive.plugin"
-DAL_DIR="/Library/CoreMediaIO/Plug-Ins/DAL"
-AUDIO_PLUGIN="iSightAudio.driver"
-AUDIO_DIR="/Library/Audio/Plug-Ins/HAL"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+INSTALL_DIR="/usr/local/libexec"
+DYLIB_DIR="/usr/local/lib"
+DAEMON_DIR="/Library/LaunchDaemons"
+AUDIO_DIR="/Library/Audio/Plug-Ins/HAL"
 
-echo "iSightRevive Installer"
-echo "======================"
+# Apple's original binary location
+SYSTEM_IIDC="/System/Library/Frameworks/CoreMediaIO.framework/Versions/A/Resources/IIDC.plugin/Contents/Resources/IIDCVideoAssistant"
+SYSTEM_IIDC_PLUGIN="/System/Library/Frameworks/CoreMediaIO.framework/Versions/A/Resources/IIDC.plugin"
+SYSTEM_AUDIO="/System/Library/Extensions/IOAudioFamily.kext/Contents/PlugIns/iSightAudio.driver"
+
+echo ""
+echo "  iSight Revive — FireWire iSight for macOS Sonoma"
+echo "  ================================================="
 echo ""
 
 # Check for root
@@ -19,48 +28,290 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-# Determine plugin source
-if [ -d "$SCRIPT_DIR/build/$PLUGIN_NAME" ]; then
-    PLUGIN_SRC="$SCRIPT_DIR/build/$PLUGIN_NAME"
-    echo "Installing from build directory..."
-elif [ -d "$SCRIPT_DIR/Prebuilt/$PLUGIN_NAME" ]; then
-    PLUGIN_SRC="$SCRIPT_DIR/Prebuilt/$PLUGIN_NAME"
-    echo "Installing pre-built binary..."
+# Check for Xcode CLI tools (optional — prebuilt binaries included)
+HAS_CLANG=0
+if command -v clang &>/dev/null; then
+    HAS_CLANG=1
+fi
+
+# Check for FireWire iSight
+if ! ioreg -r -c IOFireWireUnit 2>/dev/null | grep -q "Unit_Spec_ID.*2599"; then
+    echo "Warning: No FireWire iSight detected on the bus."
+    echo "Make sure the camera is plugged in and the FireWire kexts are loaded (OCLP)."
+    echo ""
+    read -p "Continue anyway? [y/N] " -n 1 -r
+    echo ""
+    [[ $REPLY =~ ^[Yy]$ ]] || exit 1
+fi
+
+# ============================================================================
+# Step 1: Build or use prebuilt guard fix dylib
+# ============================================================================
+echo "[1/7] Preparing guard fix dylib..."
+if [ "$HAS_CLANG" -eq 1 ]; then
+    clang -arch x86_64 -shared \
+        -o "$SCRIPT_DIR/fwafix_minimal.dylib" \
+        "$SCRIPT_DIR/fwafix_minimal.c" \
+        -lSystem -Wno-deprecated-declarations 2>/dev/null
+    codesign -s - "$SCRIPT_DIR/fwafix_minimal.dylib" 2>/dev/null
+    echo "  Built from source."
+elif [ -f "$SCRIPT_DIR/prebuilt/libfwafix.dylib" ]; then
+    cp "$SCRIPT_DIR/prebuilt/libfwafix.dylib" "$SCRIPT_DIR/fwafix_minimal.dylib"
+    echo "  Using prebuilt binary."
 else
-    echo "Error: No plugin found. Run 'make' first, or place a pre-built binary in Prebuilt/"
+    echo "  Error: No prebuilt binary and no Xcode Command Line Tools."
+    echo "  Install with: xcode-select --install"
     exit 1
 fi
 
-# Install DAL plugin
-echo "Installing $PLUGIN_NAME to $DAL_DIR/"
-mkdir -p "$DAL_DIR"
-rm -rf "$DAL_DIR/$PLUGIN_NAME"
-cp -R "$PLUGIN_SRC" "$DAL_DIR/$PLUGIN_NAME"
-chmod -R 755 "$DAL_DIR/$PLUGIN_NAME"
-echo "  Done."
+# ============================================================================
+# Step 2: Copy and patch IIDCVideoAssistant
+# ============================================================================
+echo "[2/7] Preparing IIDCVideoAssistant..."
+mkdir -p "$INSTALL_DIR"
 
-# Install audio driver if present and not already installed
-if [ -d "$SCRIPT_DIR/Drivers/$AUDIO_PLUGIN" ] && [ ! -d "$AUDIO_DIR/$AUDIO_PLUGIN" ]; then
-    echo ""
-    echo "Installing $AUDIO_PLUGIN to $AUDIO_DIR/"
-    mkdir -p "$AUDIO_DIR"
-    cp -R "$SCRIPT_DIR/Drivers/$AUDIO_PLUGIN" "$AUDIO_DIR/$AUDIO_PLUGIN"
-    chmod -R 755 "$AUDIO_DIR/$AUDIO_PLUGIN"
-    echo "  Done."
-elif [ -d "$AUDIO_DIR/$AUDIO_PLUGIN" ]; then
-    echo ""
-    echo "$AUDIO_PLUGIN already installed — skipping."
+if [ ! -f "$SYSTEM_IIDC" ]; then
+    echo "  Error: IIDCVideoAssistant not found at $SYSTEM_IIDC"
+    echo "  Is OCLP installed with FireWire support?"
+    exit 1
 fi
 
-# Kill existing camera assistants to force reload
-echo ""
-echo "Restarting camera services..."
-killall VDCAssistant 2>/dev/null || true
-killall IIDCVideoAssistant 2>/dev/null || true
+# Copy fresh from system
+cp "$SYSTEM_IIDC" "$INSTALL_DIR/IIDCVideoAssistant"
+
+# NOP the sandbox_init call at fat file offset 0xE05D
+# This is: call sandbox_init → nop nop nop nop nop (5 bytes: E8 xx xx xx xx → 90 90 90 90 90)
+# Verify the byte at 0xE05D is 0xE8 (call instruction) before patching
+BYTE=$(xxd -s 0xE05D -l 1 -p "$INSTALL_DIR/IIDCVideoAssistant")
+if [ "$BYTE" = "e8" ]; then
+    printf '\x90\x90\x90\x90\x90' | dd of="$INSTALL_DIR/IIDCVideoAssistant" bs=1 seek=$((0xE05D)) conv=notrunc 2>/dev/null
+    echo "  Sandbox call patched."
+else
+    echo "  Warning: Expected 0xE8 at offset 0xE05D, found 0x$BYTE"
+    echo "  The binary may have changed. Skipping sandbox patch."
+    echo "  Video may not work without this patch."
+fi
+
+# Re-sign with DYLD entitlements
+codesign -f -s - --entitlements "$SCRIPT_DIR/iidc_entitlements.plist" "$INSTALL_DIR/IIDCVideoAssistant" 2>/dev/null
+echo "  Signed with DYLD entitlements."
+
+# ============================================================================
+# Step 3: Symlink IIDC.plugin next to IIDCVideoAssistant
+# ============================================================================
+echo "[3/7] Symlinking IIDC.plugin..."
+ln -sf "$SYSTEM_IIDC_PLUGIN" "$INSTALL_DIR/IIDC.plugin"
 echo "  Done."
 
+# ============================================================================
+# Step 4: Install dylib
+# ============================================================================
+echo "[4/7] Installing guard fix dylib..."
+mkdir -p "$DYLIB_DIR"
+cp "$SCRIPT_DIR/fwafix_minimal.dylib" "$DYLIB_DIR/libfwafix.dylib"
+echo "  Done."
+
+# ============================================================================
+# Step 5: Install LaunchDaemon for IIDCVideoAssistant
+# ============================================================================
+echo "[5/7] Installing LaunchDaemon..."
+
+cat > "$DAEMON_DIR/com.apple.cmio.IIDCVideoAssistant.plist" << 'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.apple.cmio.IIDCVideoAssistant</string>
+	<key>MachServices</key>
+	<dict>
+		<key>com.apple.cmio.IIDCVideoAssistant</key>
+		<true/>
+	</dict>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/libexec/IIDCVideoAssistant</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>DYLD_INSERT_LIBRARIES</key>
+		<string>/usr/local/lib/libfwafix.dylib</string>
+	</dict>
+	<key>StandardErrorPath</key>
+	<string>/tmp/iidc_stderr.log</string>
+	<key>StandardOutPath</key>
+	<string>/tmp/iidc_stdout.log</string>
+	<key>ThrottleInterval</key>
+	<integer>0</integer>
+	<key>EnableTransactions</key>
+	<true/>
+	<key>POSIXSpawnType</key>
+	<string>Interactive</string>
+</dict>
+</plist>
+PLIST
+
+chmod 644 "$DAEMON_DIR/com.apple.cmio.IIDCVideoAssistant.plist"
+chown root:wheel "$DAEMON_DIR/com.apple.cmio.IIDCVideoAssistant.plist"
+
+# Load the daemon
+launchctl unload "$DAEMON_DIR/com.apple.cmio.IIDCVideoAssistant.plist" 2>/dev/null || true
+launchctl load "$DAEMON_DIR/com.apple.cmio.IIDCVideoAssistant.plist" 2>/dev/null
+echo "  Done."
+
+# ============================================================================
+# Step 6: Install audio wrapper (optional)
+# ============================================================================
+echo "[6/7] Setting up audio..."
+
+if [ -f "$SCRIPT_DIR/isight_audio_wrapper.c" ]; then
+    # Check if audio driver exists on system or in our repo
+    AUDIO_ORIG=""
+    if [ -d "$AUDIO_DIR/iSightAudio.driver" ] && [ -f "$AUDIO_DIR/iSightAudio.driver/Contents/MacOS/iSightAudio" ]; then
+        AUDIO_ORIG="$AUDIO_DIR/iSightAudio.driver/Contents/MacOS/iSightAudio"
+    elif [ -d "$AUDIO_DIR/iSightAudio.driver.disabled" ] && [ -f "$AUDIO_DIR/iSightAudio.driver.disabled/Contents/MacOS/iSightAudio.orig" ]; then
+        # Already set up from a previous install
+        echo "  Audio wrapper already installed."
+        AUDIO_ORIG=""
+    fi
+
+    if [ -n "$AUDIO_ORIG" ]; then
+        AUDIO_BUILT=0
+        if [ "$HAS_CLANG" -eq 1 ]; then
+            echo "  Building audio wrapper from source..."
+            clang -arch x86_64 -c -o /tmp/audio_wrapper.o -Wno-deprecated-declarations \
+                "$SCRIPT_DIR/isight_audio_wrapper.c" 2>/dev/null && \
+            clang++ -arch x86_64 -c -o /tmp/safe_call.o "$SCRIPT_DIR/safe_call.cpp" 2>/dev/null && \
+            clang++ -arch x86_64 -bundle -o "$SCRIPT_DIR/iSightAudioWrapper" \
+                /tmp/audio_wrapper.o /tmp/safe_call.o \
+                -framework CoreFoundation -framework CoreAudio -framework IOKit 2>/dev/null && \
+            codesign -s - "$SCRIPT_DIR/iSightAudioWrapper" 2>/dev/null && \
+            AUDIO_BUILT=1
+            rm -f /tmp/audio_wrapper.o /tmp/safe_call.o
+        fi
+        if [ "$AUDIO_BUILT" -eq 0 ] && [ -f "$SCRIPT_DIR/prebuilt/iSightAudioWrapper" ]; then
+            cp "$SCRIPT_DIR/prebuilt/iSightAudioWrapper" "$SCRIPT_DIR/iSightAudioWrapper"
+            echo "  Using prebuilt audio wrapper."
+            AUDIO_BUILT=1
+        fi
+        if [ "$AUDIO_BUILT" -eq 0 ]; then
+            echo "  Warning: Could not build audio wrapper. Audio will not work."
+            echo "  Install Xcode Command Line Tools: xcode-select --install"
+        else
+            # Rename original, install wrapper
+            mv "$AUDIO_ORIG" "${AUDIO_ORIG}.orig" 2>/dev/null || true
+            cp "$SCRIPT_DIR/iSightAudioWrapper" "$AUDIO_ORIG"
+            echo "  Audio wrapper installed."
+        fi
+    else
+        echo "  No iSightAudio.driver found on system — skipping audio."
+    fi
+else
+    echo "  Audio wrapper source not found — skipping."
+fi
+
+# ============================================================================
+# Step 7: Install boot persistence (restart avconferenced on login)
+# ============================================================================
+echo "[7/7] Setting up boot persistence..."
+
+# Create startup script
+cat > "$INSTALL_DIR/isight-startup.sh" << 'STARTUP'
+#!/bin/bash
+# iSight Revive — Boot startup script
+# Waits for FireWire bus to settle, then restarts avconferenced
+# so FaceTime discovers the camera.
+LOG="/tmp/isight_startup.log"
+
+echo "$(date): iSight startup beginning..." >> "$LOG"
+
+# Wait for FireWire bus to enumerate
+sleep 15
+
+# Check if FireWire iSight is present
+UNITS=$(ioreg -r -c IOFireWireUnit 2>/dev/null | grep -c "Unit_Spec_ID.*2599")
+echo "$(date): Found $UNITS iSight units" >> "$LOG"
+
+if [ "$UNITS" -lt 1 ]; then
+    echo "$(date): No iSight detected, waiting longer..." >> "$LOG"
+    sleep 15
+fi
+
+# Restart IIDCVideoAssistant to pick up the camera
+launchctl kickstart -k system/com.apple.cmio.IIDCVideoAssistant >> "$LOG" 2>&1
+echo "$(date): IIDCVideoAssistant restarted" >> "$LOG"
+
+# Wait for it to initialize
+sleep 5
+
+# Restart avconferenced so FaceTime discovers the camera
+# This is critical — avconferenced caches camera state at boot
+killall avconferenced 2>/dev/null
+echo "$(date): avconferenced restarted (will auto-respawn)" >> "$LOG"
+
+echo "$(date): iSight startup complete" >> "$LOG"
+STARTUP
+chmod 755 "$INSTALL_DIR/isight-startup.sh"
+
+# Install as LaunchDaemon (runs at boot as root)
+cat > "$DAEMON_DIR/com.isight-revive.startup.plist" << 'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.isight-revive.startup</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>/usr/local/libexec/isight-startup.sh</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>LaunchOnlyOnce</key>
+	<true/>
+</dict>
+</plist>
+PLIST
+chmod 644 "$DAEMON_DIR/com.isight-revive.startup.plist"
+chown root:wheel "$DAEMON_DIR/com.isight-revive.startup.plist"
+launchctl load "$DAEMON_DIR/com.isight-revive.startup.plist" 2>/dev/null || true
+echo "  Done."
+
+# ============================================================================
+# Disable any conflicting custom DAL plugins
+# ============================================================================
+for plugin in iSightDAL.plugin iSightRevive.plugin; do
+    if [ -d "/Library/CoreMediaIO/Plug-Ins/DAL/$plugin" ]; then
+        mv "/Library/CoreMediaIO/Plug-Ins/DAL/$plugin" "/Library/CoreMediaIO/Plug-Ins/DAL/${plugin}.disabled" 2>/dev/null || true
+    fi
+done
+
+# ============================================================================
+# Start everything
+# ============================================================================
 echo ""
-echo "Installation complete!"
+echo "Starting camera..."
+launchctl kickstart -k system/com.apple.cmio.IIDCVideoAssistant 2>/dev/null || true
+sleep 3
+killall avconferenced 2>/dev/null || true
+sleep 2
+
 echo ""
-echo "Open FaceTime, Photo Booth, or any camera app — you should see 'iSight' in the camera list."
-echo "To check logs: log show --predicate 'subsystem == \"com.isightrevive.dal\"' --last 1m"
+echo "  Installation complete!"
+echo ""
+echo "  Installed components:"
+echo "    Guard fix:    $DYLIB_DIR/libfwafix.dylib"
+echo "    Assistant:    $INSTALL_DIR/IIDCVideoAssistant"
+echo "    IIDC.plugin:  $INSTALL_DIR/IIDC.plugin (symlink)"
+echo "    Daemon:       $DAEMON_DIR/com.apple.cmio.IIDCVideoAssistant.plist"
+echo "    Startup:      $DAEMON_DIR/com.isight-revive.startup.plist"
+echo ""
+echo "  Open Photo Booth or FaceTime — you should see your iSight camera."
+echo "  The camera will work automatically on reboot."
+echo ""
+echo "  Troubleshooting:"
+echo "    Logs:         /tmp/fwafix.log, /tmp/isight_startup.log"
+echo "    Manual start: sudo launchctl kickstart -k system/com.apple.cmio.IIDCVideoAssistant"
+echo "    Restart FT:   sudo kill \$(pgrep avconferenced)"
+echo ""
