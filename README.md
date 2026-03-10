@@ -30,7 +30,7 @@ If `IIDCVideoAssistant` crashes, FireWire isochronous bandwidth leaks on the bus
 
 ### Audio
 
-The iSight's built-in microphone also works. Apple's original `iSightAudio.driver` uses an old CoreAudio API (flat exported functions like `AudioServerPlugIn_Initialize`) that modern macOS won't load. The installer wraps it with a translation layer that bridges the old API to the modern CFPlugIn factory pattern. All calls to the original driver are wrapped in C++ exception handlers to protect `coreaudiod` from crashes. Your iSight shows up as both a camera AND a microphone in FaceTime, Zoom, and every other app.
+The iSight's built-in microphone also works. Apple's original `iSightAudio.driver` uses an old CoreAudio API (flat exported functions like `AudioServerPlugIn_Initialize`) that modern macOS won't load. The installer wraps it with a translation layer that bridges the old API to the modern CFPlugIn factory pattern. All calls to the original driver are protected by three safety layers: C++ exception handlers, SIGSEGV/SIGBUS signal guards (the old binary has broken pointers that cause segfaults), and blocked dangerous code paths. Your iSight shows up as both a camera AND a microphone in FaceTime, Zoom, and every other app.
 
 ### No Xcode Required
 

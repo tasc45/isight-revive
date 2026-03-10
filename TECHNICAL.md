@@ -112,12 +112,14 @@ A wrapper binary (`isight_audio_wrapper.mm` + `safe_call.cpp`) replaces the orig
 2. Uses `dlopen` to load the original binary (renamed `.orig`) and resolves all `AudioServerPlugIn_*` flat exports via `dlsym`
 3. Bridges all AudioServerPlugIn calls through to the original driver (stripping the COM `driver` first argument)
 4. Wraps all property forwarding calls in C++ exception handlers (`safe_call.cpp`) to protect `coreaudiod` from crashes — the old driver throws C++ exceptions for unknown object IDs
-5. Provides a proxy host interface that absorbs the old driver's broken double-pointer dispatch convention (the old code does `rdi=vtable_ptr, rsi=host_pp` which shifts all arguments by one register)
-6. Discovers devices by querying the old driver's internal plugin object (ID 2) for `kAudioPlugInPropertyDeviceList` — the old driver assigns device IDs starting at 256, not the expected low range
-7. Handles plugin-level properties (object ID 1) directly, since the old flat API framework handled these externally
-8. Includes the same Mach port guard fix as the video side (`mach_port_deallocate` → `mach_port_destruct` with fallback)
+5. Installs SIGSEGV/SIGBUS signal handlers with `sigsetjmp`/`siglongjmp` recovery — the old binary has broken pointers (e.g. `SetPropertyData` dereferences address 0x11) that cause segfaults, which `try/catch` cannot intercept
+6. Blocks `SetPropertyData` entirely — the old binary's handler dereferences near-null pointers. The iSight mic is input-only so nothing needs setting
+7. Provides a proxy host interface that absorbs the old driver's broken double-pointer dispatch convention (the old code does `rdi=vtable_ptr, rsi=host_pp` which shifts all arguments by one register)
+8. Discovers devices by querying the old driver's internal plugin object (ID 2) for `kAudioPlugInPropertyDeviceList` with retry loop (up to 10 retries, 500ms apart) — the old driver does async FireWire discovery and assigns device IDs starting at 256
+9. Handles plugin-level properties (object ID 1) directly, since the old flat API framework handled these externally
+10. Includes the same Mach port guard fix as the video side (`mach_port_deallocate` → `mach_port_destruct` with fallback)
 
-The iSight has separate FireWire units for video (SW=258) and audio (SW=16), so video and audio work simultaneously without conflicts. The audio driver loads into `coreaudiod` (not a separate process), so crash protection is critical.
+The iSight has separate FireWire units for video (SW=258) and audio (SW=16), so video and audio work simultaneously without conflicts. The audio driver loads into `coreaudiod` (not a separate process), so crash protection is critical — a crash in the driver process kills ALL system audio.
 
 ## Boot Persistence
 
