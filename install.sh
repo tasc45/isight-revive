@@ -192,7 +192,7 @@ echo "  Done."
 # ============================================================================
 echo "[6/7] Setting up audio..."
 
-if [ -f "$SCRIPT_DIR/isight_audio_wrapper.c" ]; then
+if [ -f "$SCRIPT_DIR/isight_audio_wrapper.mm" ]; then
     # Check if audio driver exists on system or in our repo
     AUDIO_ORIG=""
     if [ -d "$AUDIO_DIR/iSightAudio.driver" ] && [ -f "$AUDIO_DIR/iSightAudio.driver/Contents/MacOS/iSightAudio" ]; then
@@ -208,7 +208,7 @@ if [ -f "$SCRIPT_DIR/isight_audio_wrapper.c" ]; then
         if [ "$HAS_CLANG" -eq 1 ]; then
             echo "  Building audio wrapper from source..."
             clang -arch x86_64 -c -o /tmp/audio_wrapper.o -Wno-deprecated-declarations \
-                "$SCRIPT_DIR/isight_audio_wrapper.c" 2>/dev/null && \
+                "$SCRIPT_DIR/isight_audio_wrapper.mm" 2>/dev/null && \
             clang++ -arch x86_64 -c -o /tmp/safe_call.o "$SCRIPT_DIR/safe_call.cpp" 2>/dev/null && \
             clang++ -arch x86_64 -bundle -o "$SCRIPT_DIR/iSightAudioWrapper" \
                 /tmp/audio_wrapper.o /tmp/safe_call.o \

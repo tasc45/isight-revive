@@ -347,24 +347,41 @@ static OSStatus plugin_GetPropertyData(AudioObjectID objID, const AudioObjectPro
 // created those objects). But to be safe, we wrap calls in a helper that
 // catches potential issues.
 
-// Simple safety wrapper: if the old binary would crash, return an error instead
+// C++ exception-safe wrappers (defined in safe_call.cpp)
+extern "C" {
+    Boolean safe_call_HasProperty(HasPropFunc fn, AudioObjectID objID, const AudioObjectPropertyAddress* addr);
+    OSStatus safe_call_IsPropertySettable(IsSettableFunc fn, AudioObjectID objID,
+                                           const AudioObjectPropertyAddress* addr, Boolean* outSettable);
+    OSStatus safe_call_GetPropertyDataSize(GetPropSizeFunc fn, AudioObjectID objID,
+                                            const AudioObjectPropertyAddress* addr,
+                                            UInt32 qualSize, const void* qual, UInt32* outSize);
+    OSStatus safe_call_GetPropertyData(GetPropDataFunc fn, AudioObjectID objID,
+                                        const AudioObjectPropertyAddress* addr,
+                                        UInt32 qualSize, const void* qual,
+                                        UInt32 inSize, UInt32* outSize, void* outData);
+    OSStatus safe_call_SetPropertyData(SetPropDataFunc fn, AudioObjectID objID,
+                                        const AudioObjectPropertyAddress* addr,
+                                        UInt32 qualSize, const void* qual,
+                                        UInt32 inSize, const void* inData);
+}
+
+// Safety wrappers: catch C++ exceptions from old binary to protect coreaudiod
 static Boolean safe_HasProperty(AudioObjectID objID, const AudioObjectPropertyAddress* addr) {
     if (!gOrig.ObjectHasProperty) return false;
-    // The old binary should handle objects it created. Just call it.
-    return gOrig.ObjectHasProperty(objID, addr);
+    return safe_call_HasProperty(gOrig.ObjectHasProperty, objID, addr);
 }
 
 static OSStatus safe_GetPropertyDataSize(AudioObjectID objID, const AudioObjectPropertyAddress* addr,
                                           UInt32 qualSize, const void* qual, UInt32* outSize) {
     if (!gOrig.ObjectGetPropertyDataSize) return kAudioHardwareUnknownPropertyError;
-    return gOrig.ObjectGetPropertyDataSize(objID, addr, qualSize, qual, outSize);
+    return safe_call_GetPropertyDataSize(gOrig.ObjectGetPropertyDataSize, objID, addr, qualSize, qual, outSize);
 }
 
 static OSStatus safe_GetPropertyData(AudioObjectID objID, const AudioObjectPropertyAddress* addr,
                                       UInt32 qualSize, const void* qual,
                                       UInt32 inSize, UInt32* outSize, void* outData) {
     if (!gOrig.ObjectGetPropertyData) return kAudioHardwareUnknownPropertyError;
-    return gOrig.ObjectGetPropertyData(objID, addr, qualSize, qual, inSize, outSize, outData);
+    return safe_call_GetPropertyData(gOrig.ObjectGetPropertyData, objID, addr, qualSize, qual, inSize, outSize, outData);
 }
 
 #pragma mark - COM Driver Object
@@ -433,29 +450,61 @@ static OSStatus wrapper_Initialize(AudioServerPlugInDriverRef inDriver, AudioSer
         LOG("Original Initialize returned: %d", (int)r);
 
         if (r == kAudioHardwareNoError) {
-            // Discover device IDs: The old binary created devices during Initialize.
-            // We need to find their IDs. The old binary's property methods for the
-            // plugin object (1) throw C++ exceptions, so we can't query 'dev#' on it.
-            // Instead, we probe object IDs 2-20 and check their class. Only objects
-            // with class 'adev' (kAudioDeviceClassID) are audio devices.
+            // Discover device IDs created by the old binary during Initialize.
+            // Strategy 1: Query old binary's internal plugin object (ID 2) for dev# list.
+            // The old binary assigns device IDs starting at 256, so probing 1-30 won't find them.
             gDeviceCount = 0;
-            for (AudioObjectID probe = 1; probe <= 30 && gDeviceCount < MAX_DEVICES; probe++) {
-                AudioObjectPropertyAddress classAddr = {
-                    kAudioObjectPropertyClass, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain
+
+            if (gOrig.ObjectGetPropertyDataSize && gOrig.ObjectGetPropertyData) {
+                AudioObjectPropertyAddress devListAddr = {
+                    kAudioPlugInPropertyDeviceList, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain
                 };
-                if (gOrig.ObjectHasProperty && gOrig.ObjectHasProperty(probe, &classAddr)) {
-                    // Read the class to check if it's a device
-                    UInt32 classVal = 0;
-                    UInt32 outSize = sizeof(classVal);
-                    if (gOrig.ObjectGetPropertyData) {
-                        OSStatus err = gOrig.ObjectGetPropertyData(probe, &classAddr, 0, NULL,
-                                                                     sizeof(classVal), &outSize, &classVal);
+                UInt32 devListSize = 0;
+                OSStatus sizeErr = safe_call_GetPropertyDataSize(gOrig.ObjectGetPropertyDataSize,
+                    2, &devListAddr, 0, NULL, &devListSize);
+                LOG("Old binary obj=2 dev# size: %u err=%d", devListSize, (int)sizeErr);
+
+                if (sizeErr == kAudioHardwareNoError && devListSize > 0) {
+                    UInt32 outSize = devListSize;
+                    AudioObjectID devBuf[MAX_DEVICES];
+                    UInt32 readSize = (devListSize < sizeof(devBuf)) ? devListSize : sizeof(devBuf);
+                    OSStatus dataErr = safe_call_GetPropertyData(gOrig.ObjectGetPropertyData,
+                        2, &devListAddr, 0, NULL, readSize, &outSize, devBuf);
+                    LOG("Old binary obj=2 dev# data: outSize=%u err=%d", outSize, (int)dataErr);
+
+                    if (dataErr == kAudioHardwareNoError) {
+                        gDeviceCount = outSize / sizeof(AudioObjectID);
+                        if (gDeviceCount > MAX_DEVICES) gDeviceCount = MAX_DEVICES;
+                        for (UInt32 i = 0; i < gDeviceCount; i++) {
+                            gDeviceIDs[i] = devBuf[i];
+                            LOG("  device[%u] = %u", i, devBuf[i]);
+                        }
+                    }
+                }
+            }
+
+            // Strategy 2: If dev# query failed, probe a wider range including high IDs
+            if (gDeviceCount == 0 && gOrig.ObjectHasProperty && gOrig.ObjectGetPropertyData) {
+                LOG("dev# query failed, probing object IDs...");
+                // Probe common ranges: 2-30 and 256-280
+                AudioObjectID probeList[] = {2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,
+                    256,257,258,259,260,261,262,263,264,265,266,267,268,269,270};
+                for (UInt32 p = 0; p < sizeof(probeList)/sizeof(probeList[0]) && gDeviceCount < MAX_DEVICES; p++) {
+                    AudioObjectID probe = probeList[p];
+                    AudioObjectPropertyAddress classAddr = {
+                        kAudioObjectPropertyClass, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain
+                    };
+                    if (safe_call_HasProperty(gOrig.ObjectHasProperty, probe, &classAddr)) {
+                        UInt32 classVal = 0;
+                        UInt32 outSize = sizeof(classVal);
+                        OSStatus err = safe_call_GetPropertyData(gOrig.ObjectGetPropertyData,
+                            probe, &classAddr, 0, NULL, sizeof(classVal), &outSize, &classVal);
                         char cls[5];
                         fourcc(classVal, cls);
                         LOG("Probed object %u: class='%s' (0x%x) err=%d", probe, cls, classVal, (int)err);
                         if (err == kAudioHardwareNoError && classVal == kAudioDeviceClassID) {
                             gDeviceIDs[gDeviceCount++] = probe;
-                            LOG("  -> This is a device! Added as device[%u]", gDeviceCount - 1);
+                            LOG("  -> Device found! Added as device[%u]", gDeviceCount - 1);
                         }
                     }
                 }
@@ -534,7 +583,7 @@ static OSStatus wrapper_IsPropertySettable(AudioServerPlugInDriverRef inDriver, 
         return plugin_IsPropertySettable(objID, addr, outSettable);
     }
     if (gOrig.ObjectIsPropertySettable)
-        return gOrig.ObjectIsPropertySettable(objID, addr, outSettable);
+        return safe_call_IsPropertySettable(gOrig.ObjectIsPropertySettable, objID, addr, outSettable);
     if (outSettable) *outSettable = false;
     return kAudioHardwareNoError;
 }
@@ -608,7 +657,7 @@ static OSStatus wrapper_SetPropertyData(AudioServerPlugInDriverRef inDriver, Aud
         return kAudioHardwareUnsupportedOperationError;
     }
     if (gOrig.ObjectSetPropertyData)
-        return gOrig.ObjectSetPropertyData(objID, addr, qualSize, qual, inSize, inData);
+        return safe_call_SetPropertyData(gOrig.ObjectSetPropertyData, objID, addr, qualSize, qual, inSize, inData);
     return kAudioHardwareUnsupportedOperationError;
 }
 
@@ -669,7 +718,7 @@ static OSStatus wrapper_EndIOOperation(AudioServerPlugInDriverRef d, AudioObject
 
 #pragma mark - Factory Function
 
-void* iSightAudioFactory(CFAllocatorRef allocator, CFUUIDRef typeUUID) {
+extern "C" void* iSightAudioFactory(CFAllocatorRef allocator, CFUUIDRef typeUUID) {
     LOG("Factory called");
 
     CFUUIDRef pluginTypeUUID = CFUUIDGetConstantUUIDWithBytes(NULL,

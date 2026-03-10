@@ -107,13 +107,17 @@ This is the single most important operational detail. The boot startup script ha
 The iSight's built-in microphone uses Apple's `iSightAudio.driver`, which exports the old flat-function AudioServerPlugIn API. Modern macOS (Catalina+) requires the CFPlugIn factory pattern and won't load drivers that don't implement it.
 
 ### Fix
-A wrapper binary (`isight_audio_wrapper.c` + `safe_call.cpp`) replaces the original `iSightAudio` binary. It:
-1. Implements the CFPlugIn factory interface that macOS expects
-2. Uses `dlopen` to load the original binary (renamed `.orig`)
-3. Bridges all AudioServerPlugIn calls through to the original driver
-4. Wraps calls in C++ exception handlers (the old driver can throw)
+A wrapper binary (`isight_audio_wrapper.mm` + `safe_call.cpp`) replaces the original `iSightAudio` binary. It:
+1. Implements the CFPlugIn factory interface (`iSightAudioFactory`) that macOS expects
+2. Uses `dlopen` to load the original binary (renamed `.orig`) and resolves all `AudioServerPlugIn_*` flat exports via `dlsym`
+3. Bridges all AudioServerPlugIn calls through to the original driver (stripping the COM `driver` first argument)
+4. Wraps all property forwarding calls in C++ exception handlers (`safe_call.cpp`) to protect `coreaudiod` from crashes — the old driver throws C++ exceptions for unknown object IDs
+5. Provides a proxy host interface that absorbs the old driver's broken double-pointer dispatch convention (the old code does `rdi=vtable_ptr, rsi=host_pp` which shifts all arguments by one register)
+6. Discovers devices by querying the old driver's internal plugin object (ID 2) for `kAudioPlugInPropertyDeviceList` — the old driver assigns device IDs starting at 256, not the expected low range
+7. Handles plugin-level properties (object ID 1) directly, since the old flat API framework handled these externally
+8. Includes the same Mach port guard fix as the video side (`mach_port_deallocate` → `mach_port_destruct` with fallback)
 
-The iSight has separate FireWire units for video (SW=258) and audio (SW=16/17), so video and audio work simultaneously without conflicts.
+The iSight has separate FireWire units for video (SW=258) and audio (SW=16), so video and audio work simultaneously without conflicts. The audio driver loads into `coreaudiod` (not a separate process), so crash protection is critical.
 
 ## Boot Persistence
 
@@ -156,8 +160,8 @@ Interposing `sandbox_init`, `IOConnectCallMethod`, and `IOConnectCallScalarMetho
 |------|---------|
 | `install.sh` | One-command installer — builds/copies everything, patches binary, sets up daemons |
 | `uninstall.sh` | Clean removal of all installed components |
-| `fwafix_minimal.c` | Guard fix DYLD interposition shim (40 lines) |
-| `isight_audio_wrapper.c` | Audio driver API bridge (CFPlugIn factory wrapper) |
+| `fwafix_minimal.c` | Guard fix + DMA retry + crash handler DYLD shim |
+| `isight_audio_wrapper.mm` | Audio driver API bridge (CFPlugIn factory wrapper) |
 | `safe_call.cpp` | C++ exception-safe wrappers for old audio driver calls |
 | `iidc_entitlements.plist` | Entitlements for DYLD injection into patched binary |
 | `bus_reset.cpp` | FireWire bus reset tool (reclaims leaked IRM bandwidth) |
