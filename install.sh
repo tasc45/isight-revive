@@ -80,18 +80,29 @@ fi
 # Copy fresh from system
 cp "$SYSTEM_IIDC" "$INSTALL_DIR/IIDCVideoAssistant"
 
-# NOP the sandbox_init call at fat file offset 0xE05D
-# This is: call sandbox_init → nop nop nop nop nop (5 bytes: E8 xx xx xx xx → 90 90 90 90 90)
-# Verify the byte at 0xE05D is 0xE8 (call instruction) before patching
+# Patch sandbox_init call at fat file offset 0xE05D
+# Replace: call sandbox_init (E8 xx xx xx xx) → xor eax,eax; nop; nop; nop (31 C0 90 90 90)
+# Must zero eax because test eax,eax at 0xE062 checks the return value
 BYTE=$(xxd -s 0xE05D -l 1 -p "$INSTALL_DIR/IIDCVideoAssistant")
 if [ "$BYTE" = "e8" ]; then
-    printf '\x90\x90\x90\x90\x90' | dd of="$INSTALL_DIR/IIDCVideoAssistant" bs=1 seek=$((0xE05D)) conv=notrunc 2>/dev/null
-    echo "  Sandbox call patched."
+    printf '\x31\xc0\x90\x90\x90' | dd of="$INSTALL_DIR/IIDCVideoAssistant" bs=1 seek=$((0xE05D)) conv=notrunc 2>/dev/null
+    echo "  Sandbox call patched (xor eax,eax)."
 else
     echo "  Warning: Expected 0xE8 at offset 0xE05D, found 0x$BYTE"
     echo "  The binary may have changed. Skipping sandbox patch."
     echo "  Video may not work without this patch."
 fi
+
+# Patch TCC checks at fat offsets 0xBA3B and 0xBD8E
+# TCCAccessPreflightWithAuditToken and TCCAccessCheckAuditToken
+# Must return 0 (granted) — the com.apple.private.tcc.manager entitlement requires Apple signing
+for TCC_OFF in 0xBA3B 0xBD8E; do
+    TCC_BYTE=$(xxd -s $TCC_OFF -l 1 -p "$INSTALL_DIR/IIDCVideoAssistant")
+    if [ "$TCC_BYTE" = "e8" ]; then
+        printf '\x31\xc0\x90\x90\x90' | dd of="$INSTALL_DIR/IIDCVideoAssistant" bs=1 seek=$(($TCC_OFF)) conv=notrunc 2>/dev/null
+        echo "  TCC check patched at $TCC_OFF (xor eax,eax)."
+    fi
+done
 
 # Re-sign with DYLD entitlements
 codesign -f -s - --entitlements "$SCRIPT_DIR/iidc_entitlements.plist" "$INSTALL_DIR/IIDCVideoAssistant" 2>/dev/null
@@ -101,7 +112,8 @@ echo "  Signed with DYLD entitlements."
 # Step 3: Symlink IIDC.plugin next to IIDCVideoAssistant
 # ============================================================================
 echo "[3/7] Symlinking IIDC.plugin..."
-ln -sf "$SYSTEM_IIDC_PLUGIN" "$INSTALL_DIR/IIDC.plugin"
+rm -f "$INSTALL_DIR/IIDC.plugin"
+ln -s "$SYSTEM_IIDC_PLUGIN" "$INSTALL_DIR/IIDC.plugin"
 echo "  Done."
 
 # ============================================================================
@@ -117,13 +129,26 @@ echo "  Done."
 # ============================================================================
 echo "[5/7] Installing LaunchDaemon..."
 
-cat > "$DAEMON_DIR/com.apple.cmio.IIDCVideoAssistant.plist" << 'PLIST'
+# System volume is sealed/read-only (APFS snapshot), so we can't modify the
+# system plist. Instead: disable the system daemon, install our own with a
+# unique label but same MachService name + correct user identity.
+# Clean up old plists from previous attempts.
+rm -f "$DAEMON_DIR/com.apple.cmio.IIDCVideoAssistant.plist" 2>/dev/null
+
+# Disable the system daemon so it doesn't compete
+launchctl disable system/com.apple.cmio.IIDCVideoAssistant 2>/dev/null || true
+launchctl bootout system/com.apple.cmio.IIDCVideoAssistant 2>/dev/null || true
+
+# Unload old custom daemon if present
+launchctl bootout system/com.isight-revive.iidc 2>/dev/null || true
+
+cat > "$DAEMON_DIR/com.isight-revive.iidc.plist" << 'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
 	<key>Label</key>
-	<string>com.apple.cmio.IIDCVideoAssistant</string>
+	<string>com.isight-revive.iidc</string>
 	<key>MachServices</key>
 	<dict>
 		<key>com.apple.cmio.IIDCVideoAssistant</key>
@@ -142,8 +167,10 @@ cat > "$DAEMON_DIR/com.apple.cmio.IIDCVideoAssistant.plist" << 'PLIST'
 	<string>/tmp/iidc_stderr.log</string>
 	<key>StandardOutPath</key>
 	<string>/tmp/iidc_stdout.log</string>
+	<key>RunAtLoad</key>
+	<true/>
 	<key>ThrottleInterval</key>
-	<integer>0</integer>
+	<integer>3</integer>
 	<key>EnableTransactions</key>
 	<true/>
 	<key>POSIXSpawnType</key>
@@ -152,12 +179,12 @@ cat > "$DAEMON_DIR/com.apple.cmio.IIDCVideoAssistant.plist" << 'PLIST'
 </plist>
 PLIST
 
-chmod 644 "$DAEMON_DIR/com.apple.cmio.IIDCVideoAssistant.plist"
-chown root:wheel "$DAEMON_DIR/com.apple.cmio.IIDCVideoAssistant.plist"
+chmod 644 "$DAEMON_DIR/com.isight-revive.iidc.plist"
+chown root:wheel "$DAEMON_DIR/com.isight-revive.iidc.plist"
 
-# Load the daemon
-launchctl unload "$DAEMON_DIR/com.apple.cmio.IIDCVideoAssistant.plist" 2>/dev/null || true
-launchctl load "$DAEMON_DIR/com.apple.cmio.IIDCVideoAssistant.plist" 2>/dev/null
+# Load our daemon
+launchctl bootstrap system "$DAEMON_DIR/com.isight-revive.iidc.plist" 2>/dev/null || \
+    launchctl load "$DAEMON_DIR/com.isight-revive.iidc.plist" 2>/dev/null
 echo "  Done."
 
 # ============================================================================
@@ -238,9 +265,12 @@ if [ "$UNITS" -lt 1 ]; then
     sleep 15
 fi
 
-# Restart IIDCVideoAssistant to pick up the camera
-launchctl kickstart -k system/com.apple.cmio.IIDCVideoAssistant >> "$LOG" 2>&1
-echo "$(date): IIDCVideoAssistant restarted" >> "$LOG"
+# Disable system daemon, start our patched one
+launchctl disable system/com.apple.cmio.IIDCVideoAssistant 2>/dev/null
+launchctl bootout system/com.apple.cmio.IIDCVideoAssistant 2>/dev/null
+sleep 1
+launchctl kickstart -k system/com.isight-revive.iidc >> "$LOG" 2>&1
+echo "$(date): IIDCVideoAssistant restarted (patched)" >> "$LOG"
 
 # Wait for it to initialize
 sleep 5
@@ -293,7 +323,9 @@ done
 # ============================================================================
 echo ""
 echo "Starting camera..."
-launchctl kickstart -k system/com.apple.cmio.IIDCVideoAssistant 2>/dev/null || true
+launchctl bootout system/com.apple.cmio.IIDCVideoAssistant 2>/dev/null || true
+sleep 1
+launchctl kickstart -k system/com.isight-revive.iidc 2>/dev/null || true
 sleep 3
 killall avconferenced 2>/dev/null || true
 sleep 2
@@ -305,7 +337,7 @@ echo "  Installed components:"
 echo "    Guard fix:    $DYLIB_DIR/libfwafix.dylib"
 echo "    Assistant:    $INSTALL_DIR/IIDCVideoAssistant"
 echo "    IIDC.plugin:  $INSTALL_DIR/IIDC.plugin (symlink)"
-echo "    Daemon:       $DAEMON_DIR/com.apple.cmio.IIDCVideoAssistant.plist"
+echo "    Daemon:       $DAEMON_DIR/com.isight-revive.iidc.plist"
 echo "    Startup:      $DAEMON_DIR/com.isight-revive.startup.plist"
 echo ""
 echo "  Open Photo Booth or FaceTime — you should see your iSight camera."
@@ -313,6 +345,6 @@ echo "  The camera will work automatically on reboot."
 echo ""
 echo "  Troubleshooting:"
 echo "    Logs:         /tmp/fwafix.log, /tmp/isight_startup.log"
-echo "    Manual start: sudo launchctl kickstart -k system/com.apple.cmio.IIDCVideoAssistant"
+echo "    Manual start: sudo launchctl kickstart -k system/com.isight-revive.iidc"
 echo "    Restart FT:   sudo kill \$(pgrep avconferenced)"
 echo ""

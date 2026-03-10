@@ -3,7 +3,6 @@ build/
 *.o
 *.dylib
 *.dSYM/
-!prebuilt/*.dylib
 
 # Compiled binaries
 iSightAudioWrapper
@@ -19,21 +18,49 @@ read_iidc_regs
 reset_camera
 scan_channels
 set_iso_speed
-test_*
-!test_*.cpp
 
 # Apple binaries (cannot redistribute — installer copies from system)
 IIDCVideoAssistant.backup
 IIDCVideoAssistant.patched
 
-# Plugin/extension builds
-DALPlugin/iSightDAL.plugin/
-CameraExtension/iSightCamera.systemextension/
-CameraExtension/iSightHost.app/
-CameraExtension/test_extension
-CameraExtension/test_extension2
+# Test/debug files (one-off experiments)
+test_*
+fix_*.cpp
 
-# macOS metadata
+# Intermediate/abandoned dylib versions
+fwafix.c
+fwafix2.c
+fwafix3.c
+fwafix4.c
+fwafix_link.c
+fwafix_min.c
+fwafix_nudcl.c
+fwafix_retry.c
+fwdebug.c
+guardfix.c
+
+# Abandoned approaches
+CameraExtension/
+DALPlugin/
+Source/
+Resources/
+Makefile
+
+# One-off scripts
+iidc_wrapper.sh
+isight_startup.plist
+list_cameras.swift
+bus_reset2.cpp
+kick_camera.cpp
+isight_capture.cpp
+iidc_mode.cpp
+reset_camera.cpp
+
+# Draft posts (personal)
+*.txt
+
+# Logs and macOS
+*.log
 .DS_Store
 xcuserdata/
 DerivedData/
